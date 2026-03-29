@@ -1,203 +1,286 @@
-"""영상 생성 엔진 - 이미지 + 자막 + 효과 → MP4"""
-import os, subprocess, math
+"""
+영상 생성 엔진 - Pillow + FFmpeg
+9:16 세로 영상 (1080x1920) with Ken Burns, 자막, 뱃지
+"""
+import os, subprocess, tempfile, math
 from PIL import Image, ImageDraw, ImageFont
 
-W, H, FPS = 1080, 1920, 24
+W, H = 1080, 1920
+FPS = 30
 
-SCENE_COLORS = {
-    "후킹": "#FF4444", "문제제기": "#FF8844",
-    "제품소개": "#44BBFF", "사회적증거": "#44DD88", "CTA": "#FFD644"
-}
-
-FONT_PATHS = [
-    "fonts/NanumGothicBold.ttf",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-    "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
-    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-    "C:/Windows/Fonts/malgunbd.ttf",
-    "C:/Windows/Fonts/malgun.ttf",
+# Ken Burns 패턴
+KB_PATTERNS = [
+    {"name": "zoom_in", "s0": 1.0, "s1": 1.3, "dx": 0, "dy": -0.05},
+    {"name": "zoom_out", "s0": 1.3, "s1": 1.0, "dx": 0, "dy": 0.05},
+    {"name": "pan_right", "s0": 1.2, "s1": 1.2, "dx": 0.15, "dy": 0},
+    {"name": "pan_up", "s0": 1.15, "s1": 1.15, "dx": 0, "dy": -0.12},
+    {"name": "drift", "s0": 1.1, "s1": 1.25, "dx": 0.08, "dy": -0.06},
 ]
 
-def get_font(size):
-    for fp in FONT_PATHS:
+SCENE_COLORS = {
+    "후킹": (255, 60, 60),
+    "문제제기": (255, 136, 68),
+    "제품소개": (68, 187, 255),
+    "사회적증거": (68, 221, 136),
+    "CTA": (255, 214, 68),
+}
+
+def _get_font(size, bold=False):
+    """한국어 폰트 로드"""
+    font_paths = [
+        "/usr/share/fonts/truetype/noto/NotoSansKR-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ]
+    for fp in font_paths:
         if os.path.exists(fp):
-            try: return ImageFont.truetype(fp, size)
-            except: continue
+            try:
+                return ImageFont.truetype(fp, size)
+            except:
+                pass
     return ImageFont.load_default()
 
-def split_chunks(text, max_len=8):
-    words = text.replace(",", " ").replace(".", " ").split()
-    chunks, buf = [], ""
-    for w in words:
-        if len(buf + " " + w) > max_len and buf:
-            chunks.append(buf.strip())
-            buf = w
-        else:
-            buf = (buf + " " + w).strip()
-    if buf: chunks.append(buf)
-    return chunks if chunks else [text[:max_len]]
+def _apply_ken_burns(img, pattern_idx, progress):
+    """Ken Burns 효과 적용"""
+    pat = KB_PATTERNS[pattern_idx % len(KB_PATTERNS)]
+    t = progress
+    scale = pat["s0"] + (pat["s1"] - pat["s0"]) * t
+    dx = pat["dx"] * t
+    dy = pat["dy"] * t
+    
+    # 이미지를 9:16으로 크롭 후 스케일
+    iw, ih = img.size
+    target_ratio = W / H
+    img_ratio = iw / ih
+    
+    if img_ratio > target_ratio:
+        new_h = ih
+        new_w = int(ih * target_ratio)
+    else:
+        new_w = iw
+        new_h = int(iw / target_ratio)
+    
+    cx, cy = iw / 2 + dx * iw, ih / 2 + dy * ih
+    crop_w, crop_h = new_w / scale, new_h / scale
+    
+    x1 = max(0, int(cx - crop_w / 2))
+    y1 = max(0, int(cy - crop_h / 2))
+    x2 = min(iw, int(cx + crop_w / 2))
+    y2 = min(ih, int(cy + crop_h / 2))
+    
+    cropped = img.crop((x1, y1, x2, y2))
+    return cropped.resize((W, H), Image.LANCZOS)
 
-def generate_video(images, script, audio_files, output_path, progress_callback=None):
-    """
-    이미지 + 대본 + 오디오 → MP4 영상 생성
+def _draw_subtitle(draw, text, y_pos, font_size=72):
+    """큰 노란 자막 (검은 외곽선)"""
+    font = _get_font(font_size, bold=True)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw = bbox[2] - bbox[0]
+    x = (W - tw) // 2
     
-    Args:
-        images: PIL Image 리스트
-        script: 대본 dict (scenes 포함)
-        audio_files: 장면별 오디오 파일 경로 리스트
-        output_path: 출력 MP4 경로
-        progress_callback: 진행률 콜백 함수 (0.0~1.0)
-    """
-    scenes = script["scenes"]
-    durations = []
-    for s in scenes:
-        m = (s.get("time","") or "").replace("초","")
-        parts = m.split("-")
-        if len(parts) == 2:
-            try: durations.append(int(parts[1]) - int(parts[0]))
-            except: durations.append(5)
-        else:
-            durations.append(5)
+    # 검은 외곽선
+    for ox in range(-4, 5, 2):
+        for oy in range(-4, 5, 2):
+            draw.text((x + ox, y_pos + oy), text, fill=(0, 0, 0), font=font)
+    # 노란 글자
+    draw.text((x, y_pos), text, fill=(255, 215, 0), font=font)
+
+def _draw_badge(draw, scene_type, y=80):
+    """장면 타입 뱃지"""
+    color = SCENE_COLORS.get(scene_type, (128, 128, 128))
+    font = _get_font(28)
+    text = f"  {scene_type}  "
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     
-    total_frames = sum(d * FPS for d in durations)
+    # 반투명 배경
+    x = 40
+    draw.rounded_rectangle(
+        [(x, y), (x + tw + 20, y + th + 16)],
+        radius=12,
+        fill=(*color, 60),
+        outline=(*color, 120),
+        width=2
+    )
+    draw.text((x + 10, y + 8), text, fill=(*color, 255), font=font)
+
+def _draw_progress_bar(draw, progress, total_progress, color):
+    """하단 프로그레스 바"""
+    # 장면 프로그레스
+    bar_y = H - 120
+    draw.rectangle([(0, bar_y), (W, bar_y + 6)], fill=(40, 40, 60))
+    draw.rectangle([(0, bar_y), (int(W * progress), bar_y + 6)], fill=color)
     
-    # 폰트 로드
-    sub_font = get_font(80)
-    narr_font = get_font(32)
-    badge_font = get_font(24)
+    # 전체 프로그레스
+    bar_y2 = H - 108
+    draw.rectangle([(0, bar_y2), (W, bar_y2 + 4)], fill=(30, 30, 50))
+    draw.rectangle([(0, bar_y2), (int(W * total_progress), bar_y2 + 4)], fill=(255, 255, 255, 80))
+
+def _draw_narration_bar(draw, text, y=H - 200):
+    """나레이션 텍스트 바"""
+    font = _get_font(28)
+    # 반투명 배경
+    draw.rectangle([(20, y), (W - 20, y + 60)], fill=(0, 0, 0, 140))
+    # 텍스트 (길면 자름)
+    display = text[:35] + "..." if len(text) > 35 else text
+    draw.text((40, y + 15), display, fill=(200, 200, 200), font=font)
+
+def generate_video(images, script, audio_files, output_path, progress_cb=None):
+    """메인 영상 생성 함수"""
+    scenes = script.get("scenes", [])
+    if not scenes:
+        return False
     
-    # 임시 디렉토리
-    frame_dir = "temp_frames"
-    os.makedirs(frame_dir, exist_ok=True)
+    tmp_dir = tempfile.mkdtemp(prefix="sc_frames_")
+    frame_idx = 0
+    total_frames = sum(s.get("duration", 5) * FPS for s in scenes)
     
-    frame_num = 0
-    for si, (scene, dur) in enumerate(zip(scenes, durations)):
+    # 자막 청크 분할
+    def chunk_text(text, max_len=7):
+        if not text:
+            return [""]
+        words = text.replace(",", " ").replace(".", " ").replace("!", " ").strip().split()
+        chunks = []
+        cur = ""
+        for w in words:
+            if len(cur + w) > max_len and cur:
+                chunks.append(cur.strip())
+                cur = w
+            else:
+                cur += (" " if cur else "") + w
+        if cur.strip():
+            chunks.append(cur.strip())
+        return chunks if chunks else [""]
+    
+    accumulated = 0
+    
+    for si, scene in enumerate(scenes):
+        dur = scene.get("duration", 5)
         scene_frames = dur * FPS
-        img = images[si % len(images)]
-        chunks = split_chunks(scene.get("narration", ""))
+        stype = scene.get("type", "제품소개")
+        color = SCENE_COLORS.get(stype, (128, 128, 128))
+        narration = scene.get("narration", "")
+        keyword = scene.get("keyword", "")
+        
+        # 자막 청크
+        chunks = chunk_text(keyword, 7)
+        chunk_dur = scene_frames / max(len(chunks), 1)
+        
+        # 이미지 선택 (순환)
+        img = images[si % len(images)] if images else None
         
         for fi in range(scene_frames):
-            t = fi / max(scene_frames - 1, 1)
+            progress = fi / scene_frames
+            total_progress = (accumulated + fi) / total_frames
             
-            # === Ken Burns 효과 ===
-            zoom = 1.15 + t * 0.2
-            iw, ih = img.size
-            ratio = max(W/iw, H/ih) * zoom
-            nw, nh = int(iw*ratio), int(ih*ratio)
-            resized = img.resize((nw, nh), Image.LANCZOS)
-            cx = max(0, min((nw-W)//2 + int(t*20-10), nw-W))
-            cy = max(0, min((nh-H)//2 + int(t*15-7), nh-H))
-            frame = resized.crop((cx, cy, cx+W, cy+H))
-            if frame.mode != "RGBA": frame = frame.convert("RGBA")
+            # 프레임 생성
+            if img:
+                frame = _apply_ken_burns(img, si, progress)
+            else:
+                frame = Image.new("RGBA", (W, H), (10, 10, 20, 255))
             
-            # === 어두운 오버레이 ===
-            ov = Image.new("RGBA", (W, H), (0,0,0,0))
-            dov = ImageDraw.Draw(ov)
-            for y in range(H):
-                if y < H*0.25: a = int(70*(1-y/(H*0.25)))
-                elif y > H*0.6: a = int(200*((y-H*0.6)/(H*0.4)))
-                else: a = 5
-                dov.line([(0,y),(W,y)], fill=(0,0,0,min(a,220)))
-            frame = Image.alpha_composite(frame, ov)
-            draw = ImageDraw.Draw(frame)
+            frame = frame.convert("RGBA")
+            overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
             
-            # === 큰 노란 자막 (빠른 전환) ===
-            chunk_dur = scene_frames / len(chunks)
-            ci = min(int(fi / chunk_dur), len(chunks)-1)
-            chunk = chunks[ci]
+            # 하단 그라데이션
+            for gy in range(400):
+                alpha = int(180 * (gy / 400))
+                draw.rectangle([(0, H - 400 + gy), (W, H - 400 + gy + 1)], fill=(0, 0, 0, alpha))
             
-            bbox = draw.textbbox((0,0), chunk, font=sub_font)
-            tw = bbox[2]-bbox[0]
-            sx, sy = (W-tw)//2, int(H*0.42)
-            for dx in range(-5,6):
-                for dy in range(-5,6):
-                    if dx*dx+dy*dy <= 25:
-                        draw.text((sx+dx,sy+dy), chunk, fill="#000000", font=sub_font)
-            draw.text((sx, sy), chunk, fill="#FFDD00", font=sub_font)
+            # 뱃지
+            _draw_badge(draw, stype)
             
-            # === 장면 뱃지 ===
-            color = SCENE_COLORS.get(scene.get("type",""), "#888")
-            label = f"{si+1}/{len(scenes)}  {scene.get('type','')}"
-            bl = draw.textbbox((0,0), label, font=badge_font)
-            btw = bl[2]-bl[0]
-            draw.rounded_rectangle([(30,30),(30+btw+24,30+40)], radius=20, fill=color)
-            draw.text((42, 36), label, fill="#FFFFFF", font=badge_font)
+            # 큰 노란 자막
+            ci = min(int(fi / chunk_dur), len(chunks) - 1)
+            _draw_subtitle(draw, chunks[ci], H - 450, font_size=80)
             
-            # === 하단 나레이션 바 ===
-            narr = scene.get("narration", "")
-            draw.rounded_rectangle([(30,H-200),(W-30,H-100)], radius=15, fill=(0,0,0,180))
-            lines = [narr[i:i+25] for i in range(0, min(len(narr),50), 25)]
-            ny = H-190
-            for line in lines:
-                b = draw.textbbox((0,0), line, font=narr_font)
-                draw.text(((W-b[2]+b[0])//2, ny), line, fill="#FFFFFF", font=narr_font)
-                ny += 38
+            # 나레이션 바
+            _draw_narration_bar(draw, narration)
             
-            # === 프로그레스 바 ===
-            bar_y = H - 50
-            seg_w = (W-80-8*(len(scenes)-1))/len(scenes)
-            for i in range(len(scenes)):
-                x = 40 + i*(seg_w+8)
-                draw.rounded_rectangle([(x,bar_y),(x+seg_w,bar_y+6)], radius=3, fill=(255,255,255,40))
-                p = 1.0 if i < si else (t if i == si else 0)
-                if p > 0:
-                    c = "#FFDD00" if i==si else "#FFFFFF"
-                    draw.rounded_rectangle([(x,bar_y),(x+seg_w*p,bar_y+6)], radius=3, fill=c)
+            # 프로그레스 바
+            _draw_progress_bar(draw, progress, total_progress, color)
             
-            # 저장
-            frame.convert("RGB").save(f"{frame_dir}/frame_{frame_num:06d}.jpg", quality=85)
-            frame_num += 1
+            # 합성
+            frame = Image.alpha_composite(frame, overlay)
+            frame = frame.convert("RGB")
             
-            if progress_callback and frame_num % (FPS*2) == 0:
-                progress_callback(frame_num / total_frames * 0.7)  # 70%까지 프레임 생성
+            frame_path = os.path.join(tmp_dir, f"frame_{frame_idx:06d}.png")
+            frame.save(frame_path, "PNG")
+            frame_idx += 1
+            
+            if progress_cb and fi % (FPS * 2) == 0:
+                progress_cb(total_progress * 0.7)
+        
+        accumulated += scene_frames
     
-    # === FFmpeg 인코딩 ===
-    if progress_callback: progress_callback(0.75)
+    if progress_cb:
+        progress_cb(0.7)
     
-    video_only = "temp_video.mp4"
-    subprocess.run([
-        "ffmpeg", "-y", "-framerate", str(FPS),
-        "-i", f"{frame_dir}/frame_%06d.jpg",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-preset", "fast", "-crf", "25", video_only
-    ], capture_output=True)
+    # FFmpeg: 프레임 → 영상
+    frames_pattern = os.path.join(tmp_dir, "frame_%06d.png")
+    temp_video = os.path.join(tmp_dir, "temp.mp4")
     
-    # === 오디오 합성 ===
-    valid_audios = [a for a in audio_files if a and os.path.exists(a)]
+    cmd = [
+        "ffmpeg", "-y",
+        "-framerate", str(FPS),
+        "-i", frames_pattern,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "fast",
+        "-crf", "23",
+        temp_video
+    ]
+    
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=120)
+    except Exception as e:
+        print(f"FFmpeg error: {e}")
+        return False
+    
+    if progress_cb:
+        progress_cb(0.85)
+    
+    # 오디오 합성
+    valid_audios = [a for a in (audio_files or []) if a and os.path.exists(a)]
     
     if valid_audios:
-        if progress_callback: progress_callback(0.85)
+        # 오디오 파일들을 concat
+        concat_list = os.path.join(tmp_dir, "audio_list.txt")
+        with open(concat_list, "w") as f:
+            for ap in valid_audios:
+                f.write(f"file '{ap}'\n")
         
-        list_file = "temp_audiolist.txt"
-        with open(list_file, "w") as f:
-            for a in audio_files:
-                if a and os.path.exists(a):
-                    f.write(f"file '{os.path.abspath(a)}'\n")
-        
-        combined = "temp_combined.mp3"
+        merged_audio = os.path.join(tmp_dir, "merged.mp3")
         subprocess.run([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", list_file, "-c:a", "libmp3lame", combined
-        ], capture_output=True)
+            "-i", concat_list, "-c:a", "libmp3lame", merged_audio
+        ], capture_output=True, timeout=60)
         
-        subprocess.run([
-            "ffmpeg", "-y", "-i", video_only, "-i", combined,
-            "-c:v", "copy", "-c:a", "aac", "-shortest", output_path
-        ], capture_output=True)
-        
-        for f in [list_file, combined]: 
-            if os.path.exists(f): os.remove(f)
+        if os.path.exists(merged_audio):
+            # 영상 + 오디오 합성
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", temp_video,
+                "-i", merged_audio,
+                "-c:v", "copy", "-c:a", "aac",
+                "-shortest",
+                output_path
+            ], capture_output=True, timeout=60)
+        else:
+            os.rename(temp_video, output_path)
     else:
-        os.rename(video_only, output_path)
+        os.rename(temp_video, output_path)
+    
+    if progress_cb:
+        progress_cb(1.0)
     
     # 정리
-    if os.path.exists(video_only) and os.path.exists(output_path):
-        try: os.remove(video_only)
-        except: pass
-    
     import shutil
-    shutil.rmtree(frame_dir, ignore_errors=True)
-    
-    if progress_callback: progress_callback(1.0)
+    try:
+        shutil.rmtree(tmp_dir)
+    except:
+        pass
     
     return os.path.exists(output_path)

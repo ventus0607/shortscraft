@@ -1,4 +1,6 @@
-"""AI 대본 생성 엔진"""
+"""
+대본 생성 엔진 - Claude API 또는 샘플
+"""
 import json
 
 def generate_with_claude(product_name, price, features, target, hook_style, duration, api_key):
@@ -7,40 +9,123 @@ def generate_with_claude(product_name, price, features, target, hook_style, dura
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
         
-        prompt = f"""유튜브 쇼핑 쇼츠 {duration}초 대본을 JSON으로 작성해.
-스타일: 슈피겐코리아 공식채널처럼 빠른컷+큰노란자막. 후킹: {hook_style}
-제품: {product_name} / 가격: {price} / 특징: {features} / 타겟: {target}
-keyword는 5~8자 한국어. narration은 자연스러운 구어체.
-마크다운없이 JSON만:
-{{"title":"제목25자","description":"설명","tags":["태그1","태그2","태그3","태그4","태그5"],"scenes":[{{"time":"0-3초","type":"후킹","narration":"나레이션","keyword":"핵심5~8자"}},{{"time":"3-8초","type":"문제제기","narration":"나레이션","keyword":"핵심"}},{{"time":"8-20초","type":"제품소개","narration":"나레이션","keyword":"핵심"}},{{"time":"20-28초","type":"사회적증거","narration":"나레이션","keyword":"핵심"}},{{"time":"28-{duration}초","type":"CTA","narration":"나레이션","keyword":"핵심"}}],"seo_keywords":["키워드1","키워드2","키워드3"],"thumbnail_text":"썸네일"}}"""
-        
-        response = client.messages.create(
+        prompt = f"""유튜브 쇼핑 쇼츠 대본을 JSON으로 만들어줘.
+
+규칙:
+- 실제 유튜버처럼 자연스러운 구어체 ("~거든요", "~잖아요", "솔직히", "진짜")
+- keyword는 5~8자 짧은 핵심 단어 (자막용)
+- 슈피겐코리아 공식 쇼츠 스타일 참고
+- 각 장면에 time 필드 포함 (예: "0:00~0:05")
+
+제품: {product_name}
+가격: {price or "미정"}
+특징: {features}
+타겟: {target}
+길이: {duration}초
+후킹: {hook_style}
+
+JSON만 출력 (코드블록 없이):
+{{"title":"제목","scenes":[{{"type":"후킹","time":"0:00~0:05","narration":"나레이션","keyword":"자막키워드","duration":5}},{{"type":"문제제기","time":"0:05~0:10","narration":"나레이션","keyword":"키워드","duration":5}},{{"type":"제품소개","time":"0:10~0:20","narration":"나레이션","keyword":"키워드","duration":10}},{{"type":"사회적증거","time":"0:20~0:25","narration":"나레이션","keyword":"키워드","duration":5}},{{"type":"CTA","time":"0:25~0:30","narration":"나레이션","keyword":"키워드","duration":5}}],"description":"설명란 텍스트","tags":["태그1","태그2","태그3","태그4","태그5"],"seo_keywords":["키워드1","키워드2","키워드3"],"hooks_alt":["대체후킹1","대체후킹2"]}}"""
+
+        msg = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=2048,
+            system="You are a JSON API. Output ONLY valid JSON. No markdown, no explanation, no code fences.",
             messages=[{"role": "user", "content": prompt}]
         )
-        text = response.content[0].text
-        text = text.replace("```json", "").replace("```", "").strip()
-        start, end = text.find("{"), text.rfind("}") + 1
-        if start >= 0 and end > start:
-            return json.loads(text[start:end])
+        
+        raw = msg.content[0].text
+        # Parse JSON with fallbacks
+        return _parse_json(raw)
     except Exception as e:
-        print(f"Claude API 오류: {e}")
-    return None
+        print(f"Claude API error: {e}")
+        return None
+
+def _parse_json(raw):
+    """JSON 파싱 (여러 전략)"""
+    if not raw:
+        return None
+    txt = raw
+    import re
+    fence = re.search(r'```(?:json)?\s*([\s\S]*?)```', txt)
+    if fence:
+        txt = fence.group(1)
+    i = txt.find("{")
+    j = txt.rfind("}")
+    if i < 0 or j < 0:
+        return None
+    s = txt[i:j+1]
+    try:
+        return json.loads(s)
+    except:
+        s = re.sub(r',\s*([}\]])', r'\1', s)
+        try:
+            return json.loads(s)
+        except:
+            return None
 
 def get_sample_script(product_name, price, features, duration):
-    """API 없을 때 샘플 대본"""
+    """샘플 대본 (API 키 없을 때)"""
+    feat_list = [f.strip() for f in features.split(",") if f.strip()]
+    feat1 = feat_list[0] if len(feat_list) > 0 else "최고 성능"
+    feat2 = feat_list[1] if len(feat_list) > 1 else "가성비"
+    feat3 = feat_list[2] if len(feat_list) > 2 else "편리함"
+    
     return {
-        "title": f"{product_name} 솔직 리뷰",
-        "description": f"{product_name} 리뷰\\n{price}에 이 성능?\\n#쇼핑 #리뷰",
-        "tags": ["리뷰", "추천", "가성비", "쇼츠", product_name.split()[0]],
+        "title": f"{product_name} 써보고 놀란 이유",
         "scenes": [
-            {"time": "0-3초", "type": "후킹", "narration": f"이 가격에 이 성능이요? {product_name} 보세요", "keyword": "가격 충격"},
-            {"time": "3-8초", "type": "문제제기", "narration": f"비싼 제품 대신 {price}이면 충분합니다", "keyword": price or "가성비"},
-            {"time": "8-20초", "type": "제품소개", "narration": f"핵심 기능 알려드릴게요. {features[:50]}", "keyword": "핵심 기능"},
-            {"time": "20-28초", "type": "사회적증거", "narration": "별점 4.5점에 리뷰 수백 개. 써본 사람들이 인정했습니다", "keyword": "리뷰 폭발"},
-            {"time": f"28-{duration}초", "type": "CTA", "narration": "링크는 댓글에 있어요. 이 가격이면 안 살 이유가 없습니다", "keyword": "지금 구매"},
+            {
+                "type": "후킹",
+                "time": "0:00~0:05",
+                "narration": f"솔직히 {price or '이 가격'}에 이 성능이요? 진짜 실화냐고요",
+                "keyword": "이 가격 실화?",
+                "duration": 5
+            },
+            {
+                "type": "문제제기",
+                "time": "0:05~0:10",
+                "narration": f"비싼 거 사자니 부담되고, 싼 거 사자니 불안하잖아요",
+                "keyword": "고민 끝!",
+                "duration": 5
+            },
+            {
+                "type": "제품소개",
+                "time": f"0:10~0:{10 + duration//3}",
+                "narration": f"{product_name} 직접 써봤는데요, {feat1}에 {feat2}까지 진짜 미쳤거든요",
+                "keyword": feat1[:7],
+                "duration": duration // 3
+            },
+            {
+                "type": "사회적증거",
+                "time": f"0:{10 + duration//3}~0:{duration - 5}",
+                "narration": f"리뷰 보면 다들 {feat3} 때문에 재구매한다고 하더라고요",
+                "keyword": "후기 폭발",
+                "duration": duration // 3
+            },
+            {
+                "type": "CTA",
+                "time": f"0:{duration - 5}~0:{duration}",
+                "narration": f"링크 타고 가면 {price or '할인가'}에 살 수 있어요. 진짜 이건 찐이에요",
+                "keyword": "지금 구매!",
+                "duration": 5
+            }
         ],
-        "seo_keywords": ["리뷰", "추천", "가성비"],
-        "thumbnail_text": f"{price} 실화?"
+        "description": f"""🔥 {product_name} 리뷰
+
+✅ {feat1}
+✅ {feat2}  
+✅ {feat3}
+
+👇 최저가 구매 링크
+[쿠팡 파트너스 링크]
+
+이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.
+
+#쇼츠 #{product_name.replace(' ','')} #가성비 #추천 #쿠팡""",
+        "tags": [product_name.split()[0], "가성비", "추천", "리뷰", "쿠팡"],
+        "seo_keywords": [product_name, f"{product_name} 리뷰", f"{product_name} 추천"],
+        "hooks_alt": [
+            f"이거 안 쓰면 손해예요 진짜로",
+            f"{product_name} 왜 이제야 알았을까"
+        ]
     }

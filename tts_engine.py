@@ -1,65 +1,82 @@
-"""TTS 음성 생성 엔진"""
-import os
+"""
+TTS 엔진 - gTTS(무료) / ElevenLabs(유료)
+"""
+import os, tempfile
 
-def generate_tts_gtts(text, output_path, lang="ko"):
-    """gTTS로 음성 생성 (무료)"""
-    try:
-        from gtts import gTTS
-        tts = gTTS(text=text, lang=lang, slow=False)
-        tts.save(output_path)
-        return True
-    except Exception as e:
-        print(f"gTTS 오류: {e}")
-        return False
-
-def generate_tts_elevenlabs(text, output_path, api_key, voice_id=None):
-    """ElevenLabs로 음성 생성 (고품질)"""
-    try:
-        from elevenlabs import ElevenLabs
-        client = ElevenLabs(api_key=api_key)
-        
-        if not voice_id:
-            # 한국어 음성 자동 선택
-            voices = client.voices.get_all()
-            ko_voice = next((v for v in voices.voices if "korean" in str(v.labels).lower()), None)
-            voice_id = ko_voice.voice_id if ko_voice else "21m00Tcm4TlvDq8ikWAM"
-        
-        audio = client.text_to_speech.convert(
-            text=text, voice_id=voice_id,
-            model_id="eleven_multilingual_v2",
-            output_format="mp3_44100_128"
-        )
-        with open(output_path, "wb") as f:
-            for chunk in audio:
-                f.write(chunk)
-        return True
-    except Exception as e:
-        print(f"ElevenLabs 오류: {e}")
-        return False
+_audio_files = []
 
 def generate_scene_audios(scenes, tts_engine="gtts", api_key=None):
-    """모든 장면의 TTS 음성을 생성합니다."""
-    os.makedirs("temp_audio", exist_ok=True)
-    audio_files = []
+    """각 장면의 나레이션으로 오디오 파일 생성"""
+    global _audio_files
+    _audio_files = []
     
     for i, scene in enumerate(scenes):
-        path = f"temp_audio/scene_{i}.mp3"
         text = scene.get("narration", "")
-        
-        if not text:
-            audio_files.append(None)
+        if not text.strip():
+            _audio_files.append(None)
             continue
         
-        if tts_engine == "elevenlabs" and api_key:
-            ok = generate_tts_elevenlabs(text, path, api_key)
-        else:
-            ok = generate_tts_gtts(text, path)
+        path = os.path.join(tempfile.gettempdir(), f"sc_tts_{i}.mp3")
         
-        audio_files.append(path if ok else None)
+        try:
+            if tts_engine == "elevenlabs" and api_key:
+                _generate_elevenlabs(text, path, api_key)
+            else:
+                _generate_gtts(text, path)
+            _audio_files.append(path)
+        except Exception as e:
+            print(f"TTS error scene {i}: {e}")
+            # Fallback to gTTS
+            try:
+                _generate_gtts(text, path)
+                _audio_files.append(path)
+            except:
+                _audio_files.append(None)
     
-    return audio_files
+    return _audio_files
+
+def _generate_gtts(text, path):
+    """gTTS로 한국어 음성 생성"""
+    from gtts import gTTS
+    tts = gTTS(text=text, lang='ko', slow=False)
+    tts.save(path)
+
+def _generate_elevenlabs(text, path, api_key):
+    """ElevenLabs API로 고품질 음성 생성"""
+    import requests
+    
+    # 한국어 지원 음성 ID (Rachel - multilingual)
+    voice_id = "21m00Tcm4TlvDq8ikWAM"
+    
+    resp = requests.post(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+        headers={
+            "xi-api-key": api_key,
+            "Content-Type": "application/json"
+        },
+        json={
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.75
+            }
+        }
+    )
+    
+    if resp.status_code == 200:
+        with open(path, "wb") as f:
+            f.write(resp.content)
+    else:
+        raise Exception(f"ElevenLabs API error: {resp.status_code}")
 
 def cleanup_audio():
     """임시 오디오 파일 정리"""
-    import shutil
-    shutil.rmtree("temp_audio", ignore_errors=True)
+    global _audio_files
+    for path in _audio_files:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except:
+                pass
+    _audio_files = []
